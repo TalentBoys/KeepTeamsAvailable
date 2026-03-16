@@ -1,10 +1,13 @@
 [package]
 name = "online"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
-[dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_System_Console"] }
 
 [profile.release]
 opt-level = "s"

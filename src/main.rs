@@ -1,23 +1,34 @@
-#![allow(non_camel_case_types)]
+#![cfg_attr(target_os = "macos", allow(non_camel_case_types))]
 
+#[cfg(target_os = "macos")]
 use core_foundation::base::mach_port_t;
+#[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{process, thread, time::Duration};
 
-// IOKit FFI bindings
+// ── macOS: IOKit FFI bindings ───────────────────────────────────────
+
+#[cfg(target_os = "macos")]
 type IOReturn = i32;
+#[cfg(target_os = "macos")]
 type io_object_t = mach_port_t;
+#[cfg(target_os = "macos")]
 type io_service_t = io_object_t;
+#[cfg(target_os = "macos")]
 type io_connect_t = mach_port_t;
 
+#[cfg(target_os = "macos")]
 const KIO_HIDCAPS_LOCK_STATE: u32 = 1;
+#[cfg(target_os = "macos")]
 const KIO_HIDPARAM_CONNECT_TYPE: u32 = 1;
 
+#[cfg(target_os = "macos")]
 extern "C" {
     fn mach_task_self() -> mach_port_t;
 }
 
+#[cfg(target_os = "macos")]
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
     fn IOServiceMatching(name: *const i8) -> *mut std::ffi::c_void;
@@ -47,7 +58,9 @@ extern "C" {
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
-/// Open a connection to the IOKit HID system
+// ── macOS implementation ────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
 fn open_hid_connection() -> Result<io_connect_t, &'static str> {
     let class_name = CString::new("IOHIDSystem").unwrap();
     unsafe {
@@ -56,7 +69,6 @@ fn open_hid_connection() -> Result<io_connect_t, &'static str> {
             return Err("Failed to create IOServiceMatching");
         }
         let service = IOServiceGetMatchingService(0, matching);
-        // IOServiceMatching dict is consumed by IOServiceGetMatchingService
         if service == 0 {
             return Err("Failed to find IOHIDSystem service");
         }
@@ -70,7 +82,7 @@ fn open_hid_connection() -> Result<io_connect_t, &'static str> {
     }
 }
 
-/// Toggle Caps Lock once (read current state, flip it, then flip back)
+#[cfg(target_os = "macos")]
 fn toggle_caps_lock(connection: io_connect_t) {
     unsafe {
         let mut state: bool = false;
@@ -79,13 +91,11 @@ fn toggle_caps_lock(connection: io_connect_t) {
             eprintln!("Warning: Failed to get Caps Lock state");
             return;
         }
-        // Toggle on
         let ret = IOHIDSetModifierLockState(connection, KIO_HIDCAPS_LOCK_STATE, !state);
         if ret != 0 {
             eprintln!("Warning: Failed to set Caps Lock state");
             return;
         }
-        // Small delay then toggle back
         thread::sleep(Duration::from_millis(100));
         let ret = IOHIDSetModifierLockState(connection, KIO_HIDCAPS_LOCK_STATE, state);
         if ret != 0 {
@@ -94,7 +104,7 @@ fn toggle_caps_lock(connection: io_connect_t) {
     }
 }
 
-/// Ensure Caps Lock is off before exiting
+#[cfg(target_os = "macos")]
 fn cleanup_caps_lock(connection: io_connect_t) {
     unsafe {
         let _ = IOHIDSetModifierLockState(connection, KIO_HIDCAPS_LOCK_STATE, false);
@@ -102,7 +112,114 @@ fn cleanup_caps_lock(connection: io_connect_t) {
     }
 }
 
+// ── Windows implementation ──────────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_CAPITAL,
+};
+
+#[cfg(target_os = "windows")]
+fn send_key_event(key: u16, flags: KEYBD_EVENT_FLAGS) {
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(key),
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    unsafe {
+        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn toggle_caps_lock() {
+    send_key_event(VK_CAPITAL.0, KEYBD_EVENT_FLAGS(0));
+    send_key_event(VK_CAPITAL.0, KEYEVENTF_KEYUP);
+    thread::sleep(Duration::from_millis(100));
+    send_key_event(VK_CAPITAL.0, KEYBD_EVENT_FLAGS(0));
+    send_key_event(VK_CAPITAL.0, KEYEVENTF_KEYUP);
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_caps_lock() {
+    let state = unsafe { GetKeyState(VK_CAPITAL.0 as i32) };
+    // Low-order bit indicates whether Caps Lock is toggled on
+    if state & 1 != 0 {
+        send_key_event(VK_CAPITAL.0, KEYBD_EVENT_FLAGS(0));
+        send_key_event(VK_CAPITAL.0, KEYEVENTF_KEYUP);
+    }
+}
+
+// ── Ctrl+C handling ─────────────────────────────────────────────────
+
+#[cfg(not(target_os = "windows"))]
+fn ctrlc_setup(flag: &'static AtomicBool) {
+    unsafe {
+        libc_signal(
+            2, // SIGINT
+            signal_handler as *const () as usize,
+        );
+    }
+    RUNNING_PTR.store(flag as *const AtomicBool as usize, Ordering::SeqCst);
+}
+
+#[cfg(not(target_os = "windows"))]
+static RUNNING_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(not(target_os = "windows"))]
+extern "C" fn signal_handler(_sig: i32) {
+    let ptr = RUNNING_PTR.load(Ordering::SeqCst);
+    if ptr != 0 {
+        let flag = unsafe { &*(ptr as *const AtomicBool) };
+        flag.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+extern "C" {
+    #[link_name = "signal"]
+    fn libc_signal(signum: i32, handler: usize) -> usize;
+}
+
+#[cfg(target_os = "windows")]
+fn ctrlc_setup(flag: &'static AtomicBool) {
+    unsafe {
+        windows::Win32::System::Console::SetConsoleCtrlHandler(
+            Some(console_ctrl_handler),
+            true,
+        )
+        .ok();
+    }
+    RUNNING_PTR_WIN.store(flag as *const AtomicBool as usize, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "windows")]
+static RUNNING_PTR_WIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn console_ctrl_handler(
+    _ctrl_type: u32,
+) -> windows::Win32::Foundation::BOOL {
+    let ptr = RUNNING_PTR_WIN.load(Ordering::SeqCst);
+    if ptr != 0 {
+        let flag = unsafe { &*(ptr as *const AtomicBool) };
+        flag.store(false, Ordering::SeqCst);
+    }
+    windows::Win32::Foundation::TRUE
+}
+
+// ── main ────────────────────────────────────────────────────────────
+
 fn main() {
+    #[cfg(target_os = "macos")]
     let connection = match open_hid_connection() {
         Ok(c) => c,
         Err(e) => {
@@ -112,16 +229,17 @@ fn main() {
         }
     };
 
-    // Handle Ctrl+C: clean up Caps Lock and exit
     ctrlc_setup(&RUNNING);
 
     println!("Online keeper started. Press Ctrl+C to stop.");
 
     while RUNNING.load(Ordering::SeqCst) {
-        println!("=");
+        #[cfg(target_os = "macos")]
         toggle_caps_lock(connection);
 
-        // Sleep in small increments so Ctrl+C is responsive
+        #[cfg(target_os = "windows")]
+        toggle_caps_lock();
+
         for _ in 0..50 {
             if !RUNNING.load(Ordering::SeqCst) {
                 break;
@@ -131,32 +249,10 @@ fn main() {
     }
 
     println!("\nStopping... cleaning up Caps Lock.");
+
+    #[cfg(target_os = "macos")]
     cleanup_caps_lock(connection);
-}
 
-/// Set up Ctrl+C handler using libc signals (no extra dependency needed)
-fn ctrlc_setup(flag: &'static AtomicBool) {
-    unsafe {
-        libc_signal(
-            2, // SIGINT
-            signal_handler as *const () as usize,
-        );
-    }
-    // Store the flag reference in a static for the handler
-    RUNNING_PTR.store(flag as *const AtomicBool as usize, Ordering::SeqCst);
-}
-
-static RUNNING_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-extern "C" fn signal_handler(_sig: i32) {
-    let ptr = RUNNING_PTR.load(Ordering::SeqCst);
-    if ptr != 0 {
-        let flag = unsafe { &*(ptr as *const AtomicBool) };
-        flag.store(false, Ordering::SeqCst);
-    }
-}
-
-extern "C" {
-    #[link_name = "signal"]
-    fn libc_signal(signum: i32, handler: usize) -> usize;
+    #[cfg(target_os = "windows")]
+    cleanup_caps_lock();
 }
